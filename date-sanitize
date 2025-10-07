@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fatal() {
+	printf 'date-sanitize: %s\n' "$1" >&2
+	exit 1
+}
+
+usage() {
+	cat <<'EOF'
+Usage: date-sanitize [OPTIONS] [PATH ...]
+
+Options:
+  -r, --recursive             Recurse into directories
+  -e, --ext EXT1,EXT2,...     Comma-separated extensions (default: jpg,jpeg,heic,tif,tiff,png)
+      --tz ZONE               Fallback timezone for naive timestamps
+      --min-year YYYY         Ignore candidates before this year (default: 2000)
+      --set-create-too        Also update EXIF:CreateDate (default)
+      --no-set-create-too     Skip EXIF:CreateDate updates
+      --quiet                 Suppress per-file status lines
+      --debug                 Print every accepted candidate
+      --deep                  Include embedded/maker-note streams (slower)
+      --no-deep               Disable deep scan if previously enabled
+  -h, --help                  Show this help
+EOF
+}
+
+trim() {
+	local s="$1"
+	s="${s#${s%%[!$' \t\n\r']*}}"
+	s="${s%${s##*[!$' \t\n\r']} }"
+	printf '%s' "$s"
+}
+
+print_status() {
+	local status="$1" file="$2" from="$3" to="$4" source="$5" count="${6:-}"
+	file=${file##*/}
+	[[ -n $from ]] || from=NONE
+	[[ -n $to ]] || to=NONE
+	[[ -n $source ]] || source=NONE
+	local line="$status  $file  from=$from  to=$to  source=$source"
+	[[ -n $count ]] && line+="  parsed=$count"
+	if [[ $status == ERROR ]]; then
+		printf '%s\n' "$line" >&2
+	elif (( QUIET == 0 )); then
+		printf '%s\n' "$line"
+	fi
+}
+
+exiftool_wrapper() {
+	if [[ -n $FALLBACK_TZ ]]; then
+		TZ="$FALLBACK_TZ" exiftool "$@"
+	else
+		exiftool "$@"
+	fi
+}
+
+collect_files() {
+	FILES=()
+	for target in "${TARGETS[@]}"; do
+		if [[ -f $target ]]; then
+			has_extension "$target" && FILES+=("$target")
+			continue
+		fi
+		if [[ -d $target ]]; then
+			local depth=()
+			(( RECURSIVE )) || depth=(-mindepth 1 -maxdepth 1)
+			while IFS= read -r -d '' path; do
+				has_extension "$path" && FILES+=("$path")
+			done < <(find "$target" "${depth[@]}" -type f -print0)
+			continue
+		fi
+		printf 'WARN  %s  reason=skipped (not a file)\n' "$target" >&2
+	done
+}
+
+has_extension() {
+	local file="$1"
+	local ext="${file##*.}"
+	[[ $file == *.* ]] || return 1
+	ext=${ext,,}
+	for allow in "${EXTENSIONS[@]}"; do
+		[[ $ext == $allow ]] && return 0
+	done
+	return 1
+}
+
+min_epoch_for_year() {
+	perl -MTime::Local -e 'print timegm(0,0,0,1,0,$ARGV[0])' "$1"
+}
+
+process_file() {
+	local file="$1"
+	local current_dto current_subsec current_epoch
+	current_dto=$(exiftool_wrapper -s3 -DateTimeOriginal "$file" 2>/dev/null || true)
+	current_subsec=$(exiftool_wrapper -s3 -SubSecTimeOriginal "$file" 2>/dev/null || true)
+	current_epoch=$(exiftool_wrapper -s3 -DateTimeOriginal -d %s "$file" 2>/dev/null || true)
+
+	local -a args=(
+		-time:all -a -u -U -G1
+		-api RequestAll=3
+		-api QuickTimeUTC=1
+		-api DateFormat=%s\|%Y:%m:%d\ %H:%M:%S\|%z\|%f
+		-tab
+	)
+	(( DEEP )) && args+=(-ee -ee2 -ee3)
+
+	local dump
+	if ! dump=$(exiftool_wrapper "${args[@]}" "$file" 2>/dev/null); then
+		print_status ERROR "$file" "$current_dto" NONE NONE
+		return 1
+	fi
+
+	mapfile -t lines <<<"$dump"
+	local -a tags epochs displays offsets subsecs
+	for entry in "${lines[@]}"; do
+		[[ -n $entry ]] || continue
+		IFS=$'\t' read -r group tag payload <<<"$entry"
+		if [[ -z $tag ]]; then
+			IFS=':' read -r group tag <<<"${group:-:}"
+			payload=${tag:-}
+		fi
+		[[ -n $group && -n $tag ]] || continue
+		[[ $group == GPS* || $group == MacOS* ]] && continue
+		IFS='|' read -r epoch display offset subsec <<<"${payload:-}"
+		epoch=$(trim "${epoch:-}")
+		[[ $epoch =~ ^[0-9]{9,}$ ]] || continue
+		display=$(trim "${display:-}")
+		offset=$(trim "${offset:-}")
+		subsec=$(trim "${subsec:-}")
+		tags+=("$group:$tag")
+		epochs+=("$epoch")
+		displays+=("$display")
+		offsets+=("$offset")
+		subsecs+=("$subsec")
+		(( DEBUG )) && printf 'DEBUG %s %s\n' "$group" "$display" >&2
+	done
+
+	local parsed=${#epochs[@]}
+	(( parsed )) || { print_status SKIPPED "$file" "$current_dto" NONE NONE 0; return 0; }
+
+	local best=-1 best_epoch=0
+	for i in "${!epochs[@]}"; do
+		local epoch=${epochs[i]}
+		(( epoch < MIN_EPOCH || epoch > MAX_EPOCH )) && continue
+		if (( best == -1 || epoch < best_epoch )); then
+			best=$i
+			best_epoch=$epoch
+		fi
+	done
+	(( best != -1 )) || { print_status SKIPPED "$file" "$current_dto" NONE NONE "$parsed"; return 0; }
+
+	local winner_tag=${tags[best]}
+	local winner_display=${displays[best]}
+	local winner_offset=${offsets[best]}
+	local winner_subsec=${subsecs[best]}
+
+	local write_wall=${winner_display%%+(*}
+	write_wall=$(trim "$write_wall")
+	[[ -n $write_wall ]] || write_wall=$(perl -e 'print scalar localtime($ARGV[0])' "$best_epoch")
+
+	local final_subsec="$winner_subsec"
+	[[ -z $final_subsec ]] && final_subsec="$current_subsec"
+	local final_offset="$winner_offset"
+	if [[ -z $final_offset && -n $FALLBACK_TZ ]]; then
+		final_offset=$(TZ="$FALLBACK_TZ" date +%z)
+	fi
+
+	local target_string="$write_wall"
+	[[ -n $final_subsec ]] && target_string+=".$final_subsec"
+	[[ -n $final_offset ]] && target_string+="$final_offset"
+
+	local same=0
+	if [[ $current_epoch =~ ^[0-9]+$ && $current_epoch == $best_epoch ]]; then
+		local existing_subsec=$(trim "$current_subsec")
+		[[ -z $winner_subsec || $winner_subsec == $existing_subsec ]] && same=1
+	fi
+
+	if (( same )); then
+		print_status UNCHANGED "$file" "$current_dto" "$target_string" "$winner_tag" "$parsed"
+		return 0
+	fi
+
+	local -a edits=(-P "-EXIF:DateTimeOriginal=$write_wall")
+	if [[ -n $final_offset ]]; then
+		edits+=("-EXIF:OffsetTimeOriginal=${final_offset:0:3}:${final_offset:3:2}")
+	fi
+	if (( SET_CREATE_TOO )); then
+		edits+=("-EXIF:CreateDate=$write_wall")
+		[[ -n $final_offset ]] && edits+=("-EXIF:OffsetTimeDigitized=${final_offset:0:3}:${final_offset:3:2}")
+	fi
+	[[ -n $final_subsec ]] && edits+=("-EXIF:SubSecTimeOriginal=$final_subsec")
+	if (( SET_CREATE_TOO )) && [[ -n $final_subsec ]]; then
+		edits+=("-EXIF:SubSecTimeDigitized=$final_subsec")
+	fi
+
+	if ! exiftool_wrapper "${edits[@]}" "$file" >/dev/null; then
+		print_status ERROR "$file" "$current_dto" NONE "$winner_tag" "$parsed"
+		return 1
+	fi
+
+	print_status APPLIED "$file" "$current_dto" "$target_string" "$winner_tag" "$parsed"
+	return 0
+}
+
+# Defaults
+RECURSIVE=0
+QUIET=0
+SET_CREATE_TOO=1
+DEBUG=0
+DEEP=0
+MIN_YEAR=2000
+FALLBACK_TZ=""
+EXTENSIONS=(jpg jpeg heic tif tiff png)
+TARGETS=()
+
+# Args
+while (($#)); do
+	case "$1" in
+		-r|--recursive) RECURSIVE=1 ;;
+		-e|--ext)
+			[[ $# -ge 2 ]] || fatal "--ext requires a value"
+			IFS=',' read -r -a EXTENSIONS <<<"${2,,}"
+			shift
+			;;
+		--tz) [[ $# -ge 2 ]] || fatal "--tz requires a value"; FALLBACK_TZ="$2"; shift ;;
+		--min-year) [[ $2 =~ ^[0-9]{4}$ ]] || fatal "--min-year must be YYYY"; MIN_YEAR=$2; shift ;;
+		--set-create-too) SET_CREATE_TOO=1 ;;
+		--no-set-create-too) SET_CREATE_TOO=0 ;;
+		--quiet) QUIET=1 ;;
+		--debug) DEBUG=1 ;;
+		--deep) DEEP=1 ;;
+		--no-deep) DEEP=0 ;;
+		-h|--help) usage; exit 0 ;;
+		--) shift; break ;;
+		-*) fatal "unknown option: $1" ;;
+		*) TARGETS+=("$1") ;;
+	esac
+	shift
+done
+
+while (($#)); do
+	TARGETS+=("$1")
+	shift
+done
+
+(( ${#TARGETS[@]} )) || TARGETS=(".")
+[[ -n $FALLBACK_TZ ]] || FALLBACK_TZ=${TZ:-}
+MIN_EPOCH=$(min_epoch_for_year "$MIN_YEAR")
+MAX_EPOCH=$(( $(date +%s) + 86400 ))
+
+collect_files
+(( ${#FILES[@]} )) || { (( QUIET )) || printf 'No matching files.\n'; exit 0; }
+
+failures=0
+for file in "${FILES[@]}"; do
+	process_file "$file" || (( failures++ ))
+done
+
+(( failures )) && exit 2
+exit 0
+
