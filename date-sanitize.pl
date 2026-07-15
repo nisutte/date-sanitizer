@@ -29,8 +29,7 @@ my %CFG = (
     deep        => 0,
     min_year    => 2000,
     fallback_tz => $ENV{TZ} // '',
-    backup      => 1,
-    exts        => [qw(jpg jpeg heic tif tiff png)],
+    exts        => [qw(jpg jpeg heic tif tiff png mp4 mov m4v)],
 );
 
 sub trim { my ($s) = @_; $s //= ''; $s =~ s/^\s+//; $s =~ s/\s+$//; $s }
@@ -40,12 +39,11 @@ sub usage {
     print <<'EOF';
 Usage: date-sanitize.pl [OPTIONS] [PATH ...]
   -r, --recursive         Recurse directories
-  -e, --ext LIST          Comma extensions (default: jpg,jpeg,heic,tif,tiff,png)
+  -e, --ext LIST          Comma extensions (default: jpg,jpeg,heic,tif,tiff,png,mp4,mov,m4v)
       --tz ZONE           Fallback timezone for naive values
       --min-year YYYY     Ignore candidates before year (default: 2000)
       --debug             Print every accepted candidate
       --deep              Include embedded/maker-note streams
-      --no-backup         Skip _original backups when writing
   -h, --help              Show this help
 EOF
 }
@@ -59,6 +57,7 @@ sub status {
     my $line = sprintf('%s  %s  from=%s  to=%s  source=%s', $status, $file, $from, $to, $source);
     $line .= sprintf('  parsed=%d', $count) if defined $count;
     $status eq 'ERROR' ? print STDERR "$line\n" : print "$line\n";
+    return $status eq 'ERROR' ? 1 : 0;
 }
 
 sub build_reader {
@@ -77,7 +76,7 @@ sub build_reader {
 
 sub build_writer {
     my $et = Image::ExifTool->new;
-    $et->Options(Backup => $CFG{backup});
+    $et->Options(QuickTimeUTC => 1);
     return $et;
 }
 
@@ -129,17 +128,25 @@ sub process_file {
     local $ENV{TZ} = $CFG{fallback_tz} if length $CFG{fallback_tz};
     $reader->ExtractInfo($file, undef, undef, 'Time:All') or return status('ERROR', $file);
 
-    my ($cur_epoch, $cur_display, undef, $cur_subsec) = parse_value($reader->GetValue('DateTimeOriginal', 'PrintConv'));
+    my $is_video = ($reader->GetValue('MIMEType') // '') =~ m{^video/};
+
+    my $cur_raw = $is_video
+        ? ($reader->GetValue('CreateDate', 'PrintConv') // $reader->GetValue('CreationDate', 'PrintConv'))
+        : $reader->GetValue('DateTimeOriginal', 'PrintConv');
+    my ($cur_epoch, $cur_display, undef, $cur_subsec) = parse_value($cur_raw);
     my @tags = $reader->GetTagList('Time');
     my (@names, @epochs, @displays, @offsets, @subsecs);
 
     for my $tag (@tags) {
         my $group = $reader->GetGroup($tag, 1) // '';
-        next if $group =~ /^GPS/ || $group eq 'MacOS';
+        next if $group =~ /^GPS/ || $group eq 'MacOS' || $group =~ /^ICC/;
         for my $val ($reader->GetValue($tag, 'PrintConv')) {
             next unless defined $val;
             my ($epoch, $display, $offset, $subsec) = parse_value($val);
             next unless $epoch =~ /^\d{9,}$/;
+            next if $display =~ /00:00:00$/;
+            next if $tag eq 'GPSDateTime';
+            next if $display =~ /^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}Z?$/ && $group eq 'Composite' && $tag eq 'GPSDateTime';
             push @names, sprintf('%s:%s', $group || 'Unknown', $tag);
             push @epochs,   $epoch;
             push @displays, $display;
@@ -169,10 +176,10 @@ sub process_file {
 
     my $write_wall = $winner_display;
     my $subsec     = length $winner_subsec ? $winner_subsec : $cur_subsec;
-    my $offset     = length $winner_offset  ? $winner_offset  : (length $CFG{fallback_tz} ? strftime('%z', localtime $best_epoch) : '');
+    my $offset     = length $winner_offset  ? $winner_offset  : (length $CFG{fallback_tz} ? localtime($best_epoch)->strftime('%z') : '');
 
     my $target = $write_wall;
-    $target .= ".$subsec" if length $subsec;
+    $target .= ".$subsec" if length $subsec && !$is_video;
     $target .= $offset     if length $offset;
 
     if (defined $cur_epoch && $cur_epoch =~ /^\d+$/ && $cur_epoch == $best_epoch) {
@@ -182,12 +189,22 @@ sub process_file {
     }
 
     $writer->SetNewValue();
-    $writer->SetNewValue('EXIF:DateTimeOriginal', $write_wall);
-    $writer->SetNewValue('EXIF:OffsetTimeOriginal', colon_offset($offset)) if length $offset;
+    if ($is_video) {
+        # QuickTimeUTC on the writer converts these to UTC using the given
+        # offset (or $TZ when no offset is known); Keys:CreationDate keeps
+        # the offset, which is what iOS Photos prefers.
+        my $value = $write_wall . colon_offset($offset);
+        $writer->SetNewValue($_, $value)
+            for qw(QuickTime:CreateDate QuickTime:ModifyDate Keys:CreationDate);
+    } else {
+        $writer->SetNewValue('EXIF:DateTimeOriginal', $write_wall);
+        $writer->SetNewValue('EXIF:OffsetTimeOriginal', colon_offset($offset)) if length $offset;
+    }
 
-    $writer->WriteInfo($file) or return status('ERROR', $file, $cur_display, undef, $winner_tag, $parsed);
-    status('APPLIED', $file, $cur_display, $target, $winner_tag, $parsed);
-    return 0;
+    my $rc = $writer->WriteInfo($file);
+    return status('ERROR', $file, $cur_display, undef, $winner_tag, $parsed) unless $rc;
+    return status('NOCHANGE', $file, $cur_display, $target, $winner_tag, $parsed) if $rc == 2;
+    return status('APPLIED', $file, $cur_display, $target, $winner_tag, $parsed);
 }
 
 sub main {
@@ -200,7 +217,6 @@ sub main {
         'min-year=i'         => \$CFG{min_year},
         'debug'              => \$CFG{debug},
         'deep'               => \$CFG{deep},
-        'no-backup'          => sub { $CFG{backup} = 0 },
         'h|help'             => sub { usage(); exit 0 },
     ) or do { usage(); return 1 };
 
