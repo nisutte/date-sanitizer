@@ -235,9 +235,9 @@ sub process_file {
 
     my $embedded_ok = defined $cur_epoch && $cur_epoch =~ /^\d+$/ && $cur_epoch == $best_epoch
                    && (!length $winner_subsec || $winner_subsec eq ($cur_subsec // ''));
-    # Apple's sync pipeline trusts filesystem timestamps over embedded dates,
-    # so the mtime must match too before a file counts as done
-    my $mtime_ok = @mtime && $mtime[0] =~ /^\d+$/ && $mtime[0] == $best_epoch;
+    # Apple's sync pipeline trusts filesystem timestamps over embedded dates
+    # for videos, so their mtime must match too before a file counts as done
+    my $mtime_ok = !$is_video || (@mtime && $mtime[0] =~ /^\d+$/ && $mtime[0] == $best_epoch);
     return status('UNCHANGED', $file, $cur_display, $target, $winner_tag, $parsed)
         if $embedded_ok && $mtime_ok;
 
@@ -255,9 +255,11 @@ sub process_file {
             $writer->SetNewValue('EXIF:OffsetTimeOriginal', colon_offset($offset)) if length $offset;
         }
     }
-    my $fs_value = $write_wall . colon_offset($offset);
-    $writer->SetNewValue('FileModifyDate', $fs_value, Protected => 1);
-    $writer->SetNewValue('FileCreateDate', $fs_value, Protected => 1) if $^O eq 'MSWin32';
+    if ($is_video) {
+        my $fs_value = $write_wall . colon_offset($offset);
+        $writer->SetNewValue('FileModifyDate', $fs_value, Protected => 1);
+        $writer->SetNewValue('FileCreateDate', $fs_value, Protected => 1) if $^O eq 'MSWin32';
+    }
 
     my $rc = $writer->WriteInfo($file);
     return status('ERROR', $file, $cur_display, undef, $winner_tag, $parsed) unless $rc;

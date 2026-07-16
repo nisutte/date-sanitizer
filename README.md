@@ -40,8 +40,7 @@ cpan Image::ExifTool                          # anywhere
 2. **Select** the earliest candidate within the allowed year range.
 3. **Write**:
    - Images: `EXIF:DateTimeOriginal` + `OffsetTimeOriginal`
-   - Videos: `QuickTime:CreateDate`/`ModifyDate` (UTC, per spec) + Apple's timezone-aware `Keys:CreationDate`
-   - All files: the filesystem modification time (and creation time on Windows) — Apple's sync pipeline trusts filesystem timestamps over embedded metadata. If only the mtime is wrong, it's fixed without rewriting the file.
+   - Videos: `QuickTime:CreateDate`/`ModifyDate` (UTC, per spec) + Apple's timezone-aware `Keys:CreationDate`, plus the filesystem modification time (and creation time on Windows) — Apple's sync pipeline trusts filesystem timestamps over embedded metadata for videos. If only the mtime is wrong, it's fixed without rewriting the file.
 
 Note: QuickTime dates are read assuming UTC storage (per spec); cameras that store local time instead will read shifted — check a sample with `--debug` before large batches.
 
@@ -50,7 +49,7 @@ Note: QuickTime dates are read assuming UTC storage (per spec); cameras that sto
 One line per file: `STATUS file from=... to=... source=... parsed=N`
 
 - `APPLIED` — dates updated
-- `UNCHANGED` — embedded date and mtime already correct
+- `UNCHANGED` — embedded date (and, for videos, mtime) already correct
 - `NOCHANGE` — write attempted but ExifTool made no changes
 - `SKIPPED` — no valid date candidate found
 - `ERROR` — read/write failure (exit code 2)
