@@ -233,24 +233,31 @@ sub process_file {
     $target .= ".$subsec" if length $subsec && !$is_video;
     $target .= $offset     if length $offset;
 
-    if (defined $cur_epoch && $cur_epoch =~ /^\d+$/ && $cur_epoch == $best_epoch) {
-        if (!length $winner_subsec || $winner_subsec eq ($cur_subsec // '')) {
-            return status('UNCHANGED', $file, $cur_display, $target, $winner_tag, $parsed);
-        }
-    }
+    my $embedded_ok = defined $cur_epoch && $cur_epoch =~ /^\d+$/ && $cur_epoch == $best_epoch
+                   && (!length $winner_subsec || $winner_subsec eq ($cur_subsec // ''));
+    # Apple's sync pipeline trusts filesystem timestamps over embedded dates,
+    # so the mtime must match too before a file counts as done
+    my $mtime_ok = @mtime && $mtime[0] =~ /^\d+$/ && $mtime[0] == $best_epoch;
+    return status('UNCHANGED', $file, $cur_display, $target, $winner_tag, $parsed)
+        if $embedded_ok && $mtime_ok;
 
     $writer->SetNewValue();
-    if ($is_video) {
-        # QuickTimeUTC on the writer converts these to UTC using the given
-        # offset (or $TZ when no offset is known); Keys:CreationDate keeps
-        # the offset, which is what iOS Photos prefers.
-        my $value = $write_wall . colon_offset($offset);
-        $writer->SetNewValue($_, $value)
-            for qw(QuickTime:CreateDate QuickTime:ModifyDate Keys:CreationDate);
-    } else {
-        $writer->SetNewValue('EXIF:DateTimeOriginal', $write_wall);
-        $writer->SetNewValue('EXIF:OffsetTimeOriginal', colon_offset($offset)) if length $offset;
+    unless ($embedded_ok) {
+        if ($is_video) {
+            # QuickTimeUTC on the writer converts these to UTC using the given
+            # offset (or $TZ when no offset is known); Keys:CreationDate keeps
+            # the offset, which is what iOS Photos prefers.
+            my $value = $write_wall . colon_offset($offset);
+            $writer->SetNewValue($_, $value)
+                for qw(QuickTime:CreateDate QuickTime:ModifyDate Keys:CreationDate);
+        } else {
+            $writer->SetNewValue('EXIF:DateTimeOriginal', $write_wall);
+            $writer->SetNewValue('EXIF:OffsetTimeOriginal', colon_offset($offset)) if length $offset;
+        }
     }
+    my $fs_value = $write_wall . colon_offset($offset);
+    $writer->SetNewValue('FileModifyDate', $fs_value, Protected => 1);
+    $writer->SetNewValue('FileCreateDate', $fs_value, Protected => 1) if $^O eq 'MSWin32';
 
     my $rc = $writer->WriteInfo($file);
     return status('ERROR', $file, $cur_display, undef, $winner_tag, $parsed) unless $rc;

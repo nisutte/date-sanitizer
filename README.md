@@ -82,6 +82,7 @@ Process specific file types:
 4. **Update**:
    - Images: sets `EXIF:DateTimeOriginal` and `EXIF:OffsetTimeOriginal`
    - Videos: sets `QuickTime:CreateDate` and `QuickTime:ModifyDate` (stored as UTC, per spec) and `Keys:CreationDate` (Apple's timezone-aware tag, preferred by iOS Photos)
+   - All files: sets the filesystem modification time (and creation time on Windows) to the same date — Apple's sync pipeline (Apple Devices app / iTunes) trusts filesystem timestamps over embedded metadata, so this is what makes synced videos show the right date on an iPhone. A file whose embedded dates are already correct but whose mtime is wrong gets a timestamp-only fix without rewriting its content.
 
 The script preserves subsecond precision and timezone information when available. QuickTime dates are read and written assuming UTC storage (as the spec requires); cameras that incorrectly store local time in `CreateDate` will read shifted by the UTC offset — check a sample with `--debug` before large batches.
 
