@@ -76,8 +76,8 @@ Process specific file types:
 
 ## How It Works
 
-1. **Extract**: Reads all date/time fields from file metadata using ExifTool
-2. **Filter**: Excludes GPS dates, system dates (MacOS), and invalid timestamps (midnight values, dates outside year range)
+1. **Extract**: Reads all date/time fields from file metadata using ExifTool, plus a date parsed from the filename when it matches a known pattern (WhatsApp `IMG/VID-YYYYMMDD-WA*`, Android `YYYYMMDD_HHMMSS`, Pixel `PXL_YYYYMMDD_HHMMSS...`). Date-only filenames are taken as 12:00 noon local time.
+2. **Filter**: Excludes GPS dates, system dates (MacOS), pseudo-tags, and invalid timestamps (midnight values, dates outside year range). Filesystem dates are not regular candidates: the file modification time is used only as a **last resort** when nothing else qualifies (it is usually just the copy time), and access/inode/create dates are ignored entirely.
 3. **Select**: Chooses the earliest valid date among all candidates
 4. **Update**:
    - Images: sets `EXIF:DateTimeOriginal` and `EXIF:OffsetTimeOriginal`

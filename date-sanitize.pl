@@ -22,6 +22,7 @@ BEGIN {
 use File::Find qw(find);
 use Getopt::Long qw(GetOptionsFromArray);
 use Time::Piece;
+use Time::Local qw(timelocal timegm);
 
 my %CFG = (
     recursive   => 0,
@@ -116,6 +117,30 @@ sub collect_files {
     return @files;
 }
 
+sub filename_date {
+    my ($file) = @_;
+    my ($name) = (split m{/+}, $file)[-1];
+    my ($y, $mo, $d, $h, $mi, $s, $utc);
+    if ($name =~ /^PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\d{3}/) {
+        # Pixel camera: time part is UTC
+        ($y, $mo, $d, $h, $mi, $s, $utc) = ($1, $2, $3, $4, $5, $6, 1);
+    } elsif ($name =~ /(?<!\d)(\d{4})(\d{2})(\d{2})[-_. ](\d{2})(\d{2})(\d{2})(?!\d)/) {
+        ($y, $mo, $d, $h, $mi, $s) = ($1, $2, $3, $4, $5, $6);
+    } elsif ($name =~ /(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)/) {
+        # date only (e.g. WhatsApp VID-YYYYMMDD-WA*): noon avoids tz day-shift
+        ($y, $mo, $d, $h, $mi, $s) = ($1, $2, $3, 12, 0, 0);
+    } else {
+        return;
+    }
+    return unless $y >= 1900 && $mo >= 1 && $mo <= 12 && $d >= 1 && $d <= 31
+               && $h <= 23 && $mi <= 59 && $s <= 59;
+    my $epoch = eval { $utc ? timegm($s, $mi, $h, $d, $mo - 1, $y)
+                            : timelocal($s, $mi, $h, $d, $mo - 1, $y) };
+    return unless defined $epoch;
+    my $t = localtime($epoch);
+    return ($epoch, $t->strftime('%Y:%m:%d %H:%M:%S'), $t->strftime('%z'));
+}
+
 sub epoch_for_year {
     my $year = shift;
     local $ENV{TZ} = $CFG{fallback_tz} if length $CFG{fallback_tz};
@@ -136,10 +161,19 @@ sub process_file {
     my ($cur_epoch, $cur_display, undef, $cur_subsec) = parse_value($cur_raw);
     my @tags = $reader->GetTagList('Time');
     my (@names, @epochs, @displays, @offsets, @subsecs);
+    my @mtime;  # System:FileModifyDate, kept aside as a last resort
 
     for my $tag (@tags) {
         my $group = $reader->GetGroup($tag, 1) // '';
         next if $group =~ /^GPS/ || $group eq 'MacOS' || $group =~ /^ICC/;
+        next if $group eq 'ExifTool';  # pseudo-tags like Now (current clock time)
+        if ($group eq 'System') {
+            # mtime is usually the copy time; access/inode/create dates always are
+            next unless $tag =~ /^FileModifyDate/;
+            my ($epoch, $display, $offset, $subsec) = parse_value(scalar $reader->GetValue($tag, 'PrintConv'));
+            @mtime = ($epoch, $display, $offset, $subsec) if $epoch =~ /^\d{9,}$/;
+            next;
+        }
         for my $val ($reader->GetValue($tag, 'PrintConv')) {
             next unless defined $val;
             my ($epoch, $display, $offset, $subsec) = parse_value($val);
@@ -156,8 +190,15 @@ sub process_file {
         }
     }
 
-    my $parsed = @epochs;
-    return status('SKIPPED', $file, $cur_display, undef, undef, 0) unless $parsed;
+    my ($fn_epoch, $fn_display, $fn_offset) = filename_date($file);
+    if (defined $fn_epoch) {
+        push @names,    'File:Filename';
+        push @epochs,   $fn_epoch;
+        push @displays, $fn_display;
+        push @offsets,  $fn_offset;
+        push @subsecs,  '';
+        print STDERR "DEBUG Filename $fn_display\n" if $CFG{debug};
+    }
 
     my ($best_idx, $best_epoch) = (-1, 0);
     for my $i (0 .. $#epochs) {
@@ -167,6 +208,16 @@ sub process_file {
             ($best_idx, $best_epoch) = ($i, $epoch);
         }
     }
+    if ($best_idx == -1 && @mtime && $mtime[0] >= $min_epoch && $mtime[0] <= $max_epoch) {
+        push @names,    'System:FileModifyDate';
+        push @epochs,   $mtime[0];
+        push @displays, $mtime[1];
+        push @offsets,  $mtime[2];
+        push @subsecs,  $mtime[3];
+        ($best_idx, $best_epoch) = ($#epochs, $mtime[0]);
+        print STDERR "DEBUG System $mtime[1] (last resort)\n" if $CFG{debug};
+    }
+    my $parsed = @epochs;
     return status('SKIPPED', $file, $cur_display, undef, undef, $parsed) if $best_idx == -1;
 
     my $winner_tag     = $names[$best_idx];
